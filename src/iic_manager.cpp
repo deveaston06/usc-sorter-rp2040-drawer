@@ -12,7 +12,7 @@
 //     - Accept ASSIGN_ADDR from ESP32
 //     - Accept PREPARE_ARP, reset AV flag
 //     - Accept SCAN_MODULES, reply with ATtiny85 address list
-//     - Accept SET_PSA, store in EEPROM
+//     - Accept SET_PSA, SYNC_PSA, store in EEPROM
 //     - Accept LED commands, relay downstream to ATtiny85
 //
 //   Downstream (Wire1, master side):
@@ -38,6 +38,11 @@ static uint8_t assignedAddr = ADDR_ARP_DEFAULT;
 static volatile uint8_t rxBuf[RX_BUF_SIZE];
 static volatile uint8_t rxLen = 0;
 static volatile bool rxPending = false;
+
+// ── Reply buffer for CMD_SCAN_MODULES ─────────────────────────────
+static uint8_t replyBuf[MAX_TINY_MODULES + 1];
+static uint8_t replyLen = 0;
+static bool replyReady = false;
 
 // ── Timing ────────────────────────────────────────────────────
 static uint32_t lastScanMs = 0;
@@ -85,9 +90,11 @@ static bool udid_matches(const volatile uint8_t *buf) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// PSA TABLE HELPERS
+// PSA TABLE
+// Entry: [udid 9][psa 1][persistent 1]
+// persistent=1 means ESP32 has authorised this address to be reused
+// persistent=0 means this entry is a working record only
 // ─────────────────────────────────────────────────────────────
-// Look up stored PSA for a given UDID. Returns 0xFF if not found.
 static uint8_t psa_lookup(const uint8_t *targetUdid) {
   for (uint8_t i = 0; i < PSA_MAX_ENTRIES; i++) {
     uint16_t base = EE_PSA_TABLE_START + (i * PSA_ENTRY_SIZE);
@@ -99,16 +106,18 @@ static uint8_t psa_lookup(const uint8_t *targetUdid) {
       }
     }
     if (match) {
-      return EEPROM.read(base + UDID_SIZE);
+      uint8_t persistent = EEPROM.read(base + UDID_SIZE + 1);
+      // only return stored address if ESP32 has marked it persistent
+      if (persistent == 0x01)
+        return EEPROM.read(base + UDID_SIZE);
     }
   }
-  return 0xFF; // not found
+  return 0xFF;
 }
 
-// Store a new PSA entry. Overwrites existing entry for same UDID.
-// If table full, overwrites slot 0 (simple eviction).
-static void psa_store(const uint8_t *targetUdid, uint8_t psa) {
-  // check if UDID already exists
+static void psa_store(const uint8_t *targetUdid, uint8_t psa,
+                      uint8_t persistent) {
+  // update existing entry
   for (uint8_t i = 0; i < PSA_MAX_ENTRIES; i++) {
     uint16_t base = EE_PSA_TABLE_START + (i * PSA_ENTRY_SIZE);
     bool match = true;
@@ -120,6 +129,7 @@ static void psa_store(const uint8_t *targetUdid, uint8_t psa) {
     }
     if (match) {
       EEPROM.write(base + UDID_SIZE, psa);
+      EEPROM.write(base + UDID_SIZE + 1, persistent);
       EEPROM.commit();
       return;
     }
@@ -132,16 +142,48 @@ static void psa_store(const uint8_t *targetUdid, uint8_t psa) {
         EEPROM.write(base + j, targetUdid[j]);
       }
       EEPROM.write(base + UDID_SIZE, psa);
+      EEPROM.write(base + UDID_SIZE + 1, persistent);
       EEPROM.commit();
       return;
     }
   }
-  // table full — overwrite slot 0
-  uint16_t base = EE_PSA_TABLE_START;
-  for (uint8_t j = 0; j < UDID_SIZE; j++) {
-    EEPROM.write(base + j, targetUdid[j]);
+}
+
+// ─────────────────────────────────────────────────────────────
+// CMD_SYNC_PSA HANDLER
+// Receives list of addresses ESP32 considers persistent.
+// Updates persistent flag on all PSA table entries accordingly.
+// Entries whose address is not in the received list are cleared to 0.
+// ─────────────────────────────────────────────────────────────
+static void handleSyncPSA(const volatile uint8_t *buf, uint8_t len) {
+  // buf[0] = CMD_SYNC_PSA already consumed
+  // buf[1] = count, buf[2..] = addresses
+  if (len < 2)
+    return;
+  uint8_t count = buf[1];
+  if (count > PSA_MAX_ENTRIES)
+    count = PSA_MAX_ENTRIES;
+
+  for (uint8_t i = 0; i < PSA_MAX_ENTRIES; i++) {
+    uint16_t base = EE_PSA_TABLE_START + (i * PSA_ENTRY_SIZE);
+    if (EEPROM.read(base) == 0xFF)
+      continue; // empty slot
+
+    uint8_t storedPSA = EEPROM.read(base + UDID_SIZE);
+    bool isInList = false;
+
+    for (uint8_t j = 0; j < count; j++) {
+      if (buf[2 + j] == storedPSA) {
+        isInList = true;
+        break;
+      }
+    }
+
+    uint8_t newFlag = isInList ? 0x01 : 0x00;
+    if (EEPROM.read(base + UDID_SIZE + 1) != newFlag) {
+      EEPROM.write(base + UDID_SIZE + 1, newFlag);
+    }
   }
-  EEPROM.write(base + UDID_SIZE, psa);
   EEPROM.commit();
 }
 
@@ -190,9 +232,9 @@ static uint8_t getNextAddr() {
 }
 
 // ─────────────────────────────────────────────────────────────
-// DOWNSTREAM: SINGLE GET_UDID CYCLE
-// Sends GET_UDID to 0x55, reads UDID, assigns address.
-// Returns true if a device was found and assigned.
+// DOWNSTREAM: GET_UDID CYCLE FOR ATTINY85
+// Stores working PSA entry (persistent=0) after assignment.
+// psa_lookup() only returns the address if ESP32 later marks it persistent.
 // ─────────────────────────────────────────────────────────────
 static bool downstream_getUdidCycle() {
   // send CMD_GET_UDID to ARP default address
@@ -212,7 +254,7 @@ static bool downstream_getUdidCycle() {
     winnerUdid[i] = Wire.read();
   }
 
-  // check PSA table first
+  // PSA lookup — only succeeds if ESP32 marked this address persistent
   uint8_t newAddr = psa_lookup(winnerUdid);
   if (newAddr == 0xFF) {
     newAddr = getNextAddr();
@@ -235,6 +277,8 @@ static bool downstream_getUdidCycle() {
   err = Wire.endTransmission();
   if (err == 0) {
     tiny_add(newAddr);
+    // store working record, not persistent until ESP32 syncs
+    psa_store(winnerUdid, newAddr, 0x00);
     return true;
   }
   return false;
@@ -285,7 +329,10 @@ static void onReceive(int numBytes) {
 }
 
 static void onRequest() {
-  if (!addressResolved) {
+  if (replyReady) {
+    Wire1.write(replyBuf, replyLen);
+    replyReady = false;
+  } else if (!addressResolved) {
     Wire1.write(udid, UDID_SIZE);
   } else {
     Wire1.write(assignedAddr);
@@ -343,21 +390,18 @@ static void processUpstreamCommand() {
   // Store count + list in a reply buffer for onRequest
   case CMD_SCAN_MODULES:
     downstream_scan();
-    // reply is handled via onRequest — see replyBuf below
+    replyBuf[0] = tinyCount;
+    for (uint8_t i = 0; i < tinyCount; i++)
+      replyBuf[i + 1] = tinyAddrs[i];
+    replyLen = tinyCount + 1;
+    replyReady = true;
     break;
 
-  case CMD_SET_PSA: {
-    // [CMD][UDID 9 bytes][PSA 1 byte]
-    if (rxLen >= UDID_SIZE + 2) {
-      uint8_t targetUdid[UDID_SIZE];
-      for (uint8_t i = 0; i < UDID_SIZE; i++) {
-        targetUdid[i] = rxBuf[1 + i];
-      }
-      uint8_t psa = rxBuf[1 + UDID_SIZE];
-      psa_store(targetUdid, psa);
-    }
+  case CMD_SYNC_PSA:
+    // ESP32 is pushing its authoritative PSA list
+    // update persistent flags in our PSA table
+    handleSyncPSA(rxBuf, rxLen);
     break;
-  }
 
   case CMD_LED_GREEN:
     // rxBuf[1] = target ATtiny85 address

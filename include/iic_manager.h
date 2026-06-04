@@ -26,8 +26,8 @@
 #define CMD_GET_UDID 0x01
 #define CMD_ASSIGN_ADDR 0x02
 #define CMD_PREPARE_ARP 0x03
-#define CMD_SET_PSA 0x04
 #define CMD_SCAN_MODULES 0x05
+#define CMD_SYNC_PSA 0x06
 #define CMD_LED_GREEN 0x10
 #define CMD_LED_RED 0x11
 #define CMD_LED_BLUE 0x12
@@ -43,7 +43,7 @@
 #define EE_AV_FLAG 9
 #define EE_ASSIGNED_ADDR 10
 #define EE_PSA_TABLE_START 11
-#define PSA_ENTRY_SIZE 10 // 9 UDID + 1 PSA address
+#define PSA_ENTRY_SIZE 11 // 9 UDID + 1 PSA + 1 persistent flag
 #define PSA_MAX_ENTRIES 8
 #define EEPROM_SIZE 256
 

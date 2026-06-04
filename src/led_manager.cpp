@@ -2,9 +2,9 @@
 // led_manager.cpp — RP2040 Drawer
 //
 // Hardware (all active low):
-//   Red   LED → GP10
-//   Green LED → GP11
-//   Blue  LED → GP12
+//   Red   LED
+//   Green LED
+//   Blue  LED
 //
 // Behaviour:
 //   Red  = default state

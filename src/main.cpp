@@ -17,10 +17,10 @@
 //   Uncomment the block in setup(), flash with unique value, recomment.
 //
 // Bus wiring:
-//   Wire  (Bus 0) SDA GP4  SCL GP5  — slave to ESP32
-//   Wire1 (Bus 1) SDA GP2  SCL GP3  — master to ATtiny85
-//   ALERT up  GP6 (open-drain out)  — to ESP32 ALERT input
-//   ALERT down GP7 (input pull-up)  — from ATtiny85 ALERT line
+//   Wire  (Bus 0)
+//   Wire1 (Bus 1)
+//   ALERT up (open-drain out)
+//   ALERT down (input with external pull-up)
 // ─────────────────────────────────────────────────────────────
 
 #include <Arduino.h>
