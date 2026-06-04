@@ -1,47 +1,58 @@
+// ─────────────────────────────────────────────────────────────
+// main.cpp — RP2040 Drawer (Intermediary)
+// PlatformIO + arduino-pico (Earle Philhower)
+//
+// platformio.ini:
+//   [env:rp2040]
+//   platform  = https://github.com/maxgerhardt/platform-raspberrypi.git
+//   board     = rpipico
+//   framework = arduino
+//   board_build.core = earlephilhower
+//
+// Board manager URL for Arduino IDE:
+//   https://github.com/earlephilhower/arduino-pico/releases/download/global/package_rp2040_index.json
+//
+// First-time setup:
+//   Call iic_writeUDID(uniqueSerial) ONCE per device before normal use.
+//   Uncomment the block in setup(), flash with unique value, recomment.
+//
+// Bus wiring:
+//   Wire  (Bus 0) SDA GP4  SCL GP5  — slave to ESP32
+//   Wire1 (Bus 1) SDA GP2  SCL GP3  — master to ATtiny85
+//   ALERT up  GP6 (open-drain out)  — to ESP32 ALERT input
+//   ALERT down GP7 (input pull-up)  — from ATtiny85 ALERT line
+// ─────────────────────────────────────────────────────────────
+
 #include <Arduino.h>
 #include <iic_manager.h>
 #include <led_manager.h>
-/*
- * RP2040 I2C Slave — Blink on Command
- *
- * Hardware:
- *   I2C Bus
- *     SDA → GP4 (Wire default on arduino-pico)
- *     SCL → GP5 (Wire default on arduino-pico)
- *
- *   LED
- *     Built-in LED on GP25 (standard RP2040)
- *     OR external LED on GP15 via 330Ω to GND
- *
- * I2C Slave Address:
- *   Change SLAVE_ADDR below to a unique address per module
- *   Valid range: 0x08 to 0x77
- *   Example: module 1 = 0x10, module 2 = 0x11, module 3 = 0x12
- *
- * Commands received from master:
- *   0x01 → blink LED 3 times
- *
- * Note:
- *   In the final framework this address will be assigned
- *   dynamically by the enumeration protocol. For this demo
- *   it is set manually per device.
- */
 
+// ─────────────────────────────────────────────────────────────
+// SETUP
+// ─────────────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
 
-  setupI2C();
-  setupLED();
+  led_init();
 
-  // startup blink confirms address and boot
-  Serial.print("RP2040 slave ready at 0x");
-  Serial.println(SLAVE_ADDR, HEX);
-  blinkLED();
+  // ── FIRST TIME ONLY: write unique UDID ────────────────────
+  // iic_writeUDID(0x00000010); // drawer 1
+  iic_writeUDID(0x00000011); // drawer 2
+
+  iic_init();
+  // iic_init() asserts ALERT up to ESP32 if this RP2040 has
+  // no stored address, triggering automatic enumeration by ESP32.
+  // iic_init() also sets up Wire1 master and ALERT down interrupt
+  // for ATtiny85 hot-plug detection.
 }
 
+// ─────────────────────────────────────────────────────────────
+// LOOP
+// ─────────────────────────────────────────────────────────────
 void loop() {
-  if (blinkPending) {
-    blinkPending = false;
-    blinkLED();
-  }
+  iic_update();
+  // iic_update() handles:
+  //   - upstream commands from ESP32 (via rxPending flag)
+  //   - downstream ALERT from ATtiny85 (via alertDownPending flag)
+  //   - periodic ATtiny85 scanner every 5 seconds
 }
