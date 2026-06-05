@@ -55,7 +55,7 @@ static void alertUp_assert() {
   digitalWrite(PIN_ALERT_UP, LOW);
 }
 
-static void alertUp_release() { digitalWrite(PIN_ALERT_UP, HIGH); }
+static void alertUp_release() { pinMode(PIN_ALERT_UP, INPUT); }
 
 // ─────────────────────────────────────────────────────────────
 // UDID HELPERS
