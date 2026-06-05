@@ -3,8 +3,8 @@
 // arduino-pico Wire library (PlatformIO)
 //
 // Two I2C buses:
-//   Wire  (Bus 0) — slave to ESP32     SDA GP4 / SCL GP5
-//   Wire1 (Bus 1) — master to ATtiny85 SDA GP2 / SCL GP3
+//   Wire (Bus 0) — master to ATtiny85
+//   Wire1 (Bus 1) — slave to ESP32
 //
 // Responsibilities:
 //   Upstream (Wire, slave side):
@@ -363,6 +363,9 @@ static void processUpstreamCommand() {
         EEPROM.commit();
 
         Wire1.end();
+
+        Wire1.setSDA(BUS1_SDA);
+        Wire1.setSCL(BUS1_SCL);
         Wire1.begin(assignedAddr);
         Wire1.onReceive(onReceive);
         Wire1.onRequest(onRequest);
@@ -379,6 +382,9 @@ static void processUpstreamCommand() {
     EEPROM.commit();
 
     Wire1.end();
+
+    Wire1.setSDA(BUS1_SDA);
+    Wire1.setSCL(BUS1_SCL);
     Wire1.begin(ADDR_ARP_DEFAULT);
     Wire1.onReceive(onReceive);
     Wire1.onRequest(onRequest);
