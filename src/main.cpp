@@ -35,15 +35,15 @@ void setup() {
 
   led_init();
 
-  // ── FIRST TIME ONLY: write unique UDID ────────────────────
-  // iic_writeUDID(0x00000010); // drawer 1
-  // iic_writeUDID(0x00000011); // drawer 2
-
   iic_init();
   // iic_init() asserts ALERT up to ESP32 if this RP2040 has
   // no stored address, triggering automatic enumeration by ESP32.
   // iic_init() also sets up Wire1 master and ALERT down interrupt
   // for ATtiny85 hot-plug detection.
+
+  // ── FIRST TIME ONLY: write unique UDID ────────────────────
+  // iic_writeUDID(0x00000010); // drawer 1
+  // iic_writeUDID(0x00000011); // drawer 2
 }
 
 // ─────────────────────────────────────────────────────────────

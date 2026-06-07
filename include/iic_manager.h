@@ -14,7 +14,7 @@
 #define BUS1_SCL 27
 
 // ── ALERT pins ────────────────────────────────────────────────
-#define PIN_ALERT_UP 28  // ALERT to ESP32 (open-drain output)
+#define PIN_ALERT_UP 15  // ALERT to ESP32 (open-drain output)
 #define PIN_ALERT_DOWN 2 // ALERT from ATtiny85 (input, external pull-up)
 
 // ── I2C addresses ─────────────────────────────────────────────
@@ -34,15 +34,13 @@
 
 // ── EEPROM layout ─────────────────────────────────────────────
 // 0-8:   Own UDID (9 bytes)
-// 9:     AV flag (1 byte)
-// 10:    Assigned addr (1 byte)
-// 11-90: PSA table, 8 entries x 10 bytes
+// 9:    Assigned addr (1 byte)
+// 10-89: PSA table, 8 entries x 10 bytes
 //        each entry: [serial 4 bytes][psa 1 byte][valid 1 byte][udid 9 bytes -
 //        serial overlap] simplified: [udid 9 bytes][psa 1 byte]
 #define EE_UDID_START 0
-#define EE_AV_FLAG 9
-#define EE_ASSIGNED_ADDR 10
-#define EE_PSA_TABLE_START 11
+#define EE_ASSIGNED_ADDR 9
+#define EE_PSA_TABLE_START 19
 #define PSA_ENTRY_SIZE 11 // 9 UDID + 1 PSA + 1 persistent flag
 #define PSA_MAX_ENTRIES 8
 #define EEPROM_SIZE 256

@@ -188,6 +188,13 @@ static void handleSyncPSA(const volatile uint8_t *buf, uint8_t len) {
 }
 
 // ─────────────────────────────────────────────────────────────
+// ALERT DOWN ISR
+// ─────────────────────────────────────────────────────────────
+static volatile bool alertDownPending = false;
+
+static void onAlertDown() { alertDownPending = true; }
+
+// ─────────────────────────────────────────────────────────────
 // DOWNSTREAM: ATTINY85 MODULE LIST HELPERS
 // ─────────────────────────────────────────────────────────────
 static bool tiny_isKnown(uint8_t addr) {
@@ -237,30 +244,35 @@ static uint8_t getNextAddr() {
 // psa_lookup() only returns the address if ESP32 later marks it persistent.
 // ─────────────────────────────────────────────────────────────
 static bool downstream_getUdidCycle() {
-  // send CMD_GET_UDID to ARP default address
+  // Step 1: Send CMD_GET_UDID
   Wire.beginTransmission(ADDR_ARP_DEFAULT);
   Wire.write(CMD_GET_UDID);
   uint8_t err = Wire.endTransmission();
   if (err != 0)
     return false; // no device at 0x55
 
-  // request UDID bytes
-  uint8_t received = Wire.requestFrom(ADDR_ARP_DEFAULT, (uint8_t)UDID_SIZE);
-  if (received < UDID_SIZE)
-    return false;
+  delay(5); // Give ATtiny85 time to prepare
+
+  // Step 2: Request UDID - winning ATtiny85 responds
+  uint8_t received =
+      Wire.requestFrom((uint8_t)ADDR_ARP_DEFAULT, (uint8_t)UDID_SIZE);
+
+  if (received < UDID_SIZE) {
+    return false; // No device responded
+  }
 
   uint8_t winnerUdid[UDID_SIZE];
   for (uint8_t i = 0; i < UDID_SIZE; i++) {
     winnerUdid[i] = Wire.read();
   }
 
-  // PSA lookup — only succeeds if ESP32 marked this address persistent
+  // Step 3: PSA lookup — only succeeds if ESP32 marked this address persistent
   uint8_t newAddr = psa_lookup(winnerUdid);
   if (newAddr == 0xFF) {
     newAddr = getNextAddr();
   }
 
-  // send ASSIGN_ADDR: [CMD][UDID 9 bytes][new addr]
+  // Step 4: Assign address
   Wire.beginTransmission(ADDR_ARP_DEFAULT);
   Wire.write(CMD_ASSIGN_ADDR);
   for (uint8_t i = 0; i < UDID_SIZE; i++) {
@@ -272,7 +284,7 @@ static bool downstream_getUdidCycle() {
   // small delay for slave to reinitialize its Wire
   delay(10);
 
-  // verify by probing new address
+  // Step 5: Verify: by probing new address
   Wire.beginTransmission(newAddr);
   err = Wire.endTransmission();
   if (err == 0) {
@@ -289,6 +301,7 @@ static bool downstream_getUdidCycle() {
 // Repeats GET_UDID cycles until no more unresolved devices
 // ─────────────────────────────────────────────────────────────
 static void downstream_enumerate() {
+  detachInterrupt(digitalPinToInterrupt(PIN_ALERT_DOWN));
   // reset all devices first
   Wire.beginTransmission(ADDR_ARP_DEFAULT);
   Wire.write(CMD_PREPARE_ARP);
@@ -301,6 +314,7 @@ static void downstream_enumerate() {
     if (!downstream_getUdidCycle())
       break;
   }
+  attachInterrupt(digitalPinToInterrupt(PIN_ALERT_DOWN), onAlertDown, FALLING);
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -358,7 +372,6 @@ static void processUpstreamCommand() {
       if (udid_matches(&rxBuf[1])) {
         assignedAddr = rxBuf[UDID_SIZE + 1];
         addressResolved = true;
-        EEPROM.write(EE_AV_FLAG, 0x01);
         EEPROM.write(EE_ASSIGNED_ADDR, assignedAddr);
         EEPROM.commit();
 
@@ -372,14 +385,15 @@ static void processUpstreamCommand() {
 
         alertUp_release();
         led_blinkRedOnAssignment();
+      } else {
+        delay(20);
+        alertUp_assert();
       }
     }
     break;
 
   case CMD_PREPARE_ARP:
     addressResolved = false;
-    EEPROM.write(EE_AV_FLAG, 0x00);
-    EEPROM.commit();
 
     Wire1.end();
 
@@ -388,7 +402,6 @@ static void processUpstreamCommand() {
     Wire1.begin(ADDR_ARP_DEFAULT);
     Wire1.onReceive(onReceive);
     Wire1.onRequest(onRequest);
-    alertUp_assert();
     break;
 
   // ESP32 requests list of ATtiny85 addresses
@@ -438,49 +451,40 @@ static void processUpstreamCommand() {
 }
 
 // ─────────────────────────────────────────────────────────────
-// ALERT DOWN ISR
-// ─────────────────────────────────────────────────────────────
-static volatile bool alertDownPending = false;
-
-static void onAlertDown() { alertDownPending = true; }
-
-// ─────────────────────────────────────────────────────────────
 // PUBLIC: INIT
 // ─────────────────────────────────────────────────────────────
 void iic_init() {
+  alertUp_release();
+
   EEPROM.begin(EEPROM_SIZE);
 
-  // ALERT up — open-drain output initially asserted
-  alertUp_assert();
+  addressResolved = false;
 
-  // ALERT down — floating input with external pull-up, interrupt on falling
-  // edge
-  pinMode(PIN_ALERT_DOWN, INPUT);
-  attachInterrupt(digitalPinToInterrupt(PIN_ALERT_DOWN), onAlertDown, FALLING);
-
-  // load own UDID
   udid_load();
 
-  // Bus 1 — slave to ESP32
+  // Bus 1 — slave to ESP32, always start at ARP default
   Wire1.setSDA(BUS1_SDA);
   Wire1.setSCL(BUS1_SCL);
-  uint8_t avFlag = EEPROM.read(EE_AV_FLAG);
-  if (avFlag == 0x01) {
-    assignedAddr = EEPROM.read(EE_ASSIGNED_ADDR);
-    addressResolved = true;
-    Wire1.begin(assignedAddr);
-    alertUp_release();
-  } else {
-    Wire1.begin(ADDR_ARP_DEFAULT);
-  }
+  Wire1.begin(ADDR_ARP_DEFAULT);
   Wire1.onReceive(onReceive);
   Wire1.onRequest(onRequest);
+
+  while (true) {
+    // synchronization, to synzhronize with other rp2040s
+    if (millis() > 1000 || digitalRead(PIN_ALERT_UP) == LOW) {
+      alertUp_assert();
+      break;
+    }
+  }
 
   // Bus 0 — master to ATtiny85
   Wire.setSDA(BUS0_SDA);
   Wire.setSCL(BUS0_SCL);
   Wire.begin();
   Wire.setClock(100000);
+
+  pinMode(PIN_ALERT_DOWN, INPUT);
+  attachInterrupt(digitalPinToInterrupt(PIN_ALERT_DOWN), onAlertDown, FALLING);
 }
 
 // ─────────────────────────────────────────────────────────────
