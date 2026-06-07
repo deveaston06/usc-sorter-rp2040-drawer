@@ -51,10 +51,12 @@
 #define PROTOCOL_VERSION 0x0001
 #define CAPABILITIES 0x03 // master + slave
 
-#define MAX_TINY_MODULES 8
-
+// ── SYSTEM PROTOCOL CONSTRAINTS -------------------------------
+#define MAX_TINY_MODULES 500
+#define TINY_START_ADDRESS 0x40
 #define RX_BUF_SIZE 16
 
+// ── OTHER -----------------------------------------------------
 #define SCAN_INTERVAL_MS 5000
 
 void iic_init();

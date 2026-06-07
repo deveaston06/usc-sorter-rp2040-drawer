@@ -206,7 +206,7 @@ static bool tiny_isKnown(uint8_t addr) {
 }
 
 static void tiny_add(uint8_t addr) {
-  if (tinyCount < MAX_TINY_MODULES && !tiny_isKnown(addr)) {
+  if (tinyCount < (uint8_t)MAX_TINY_MODULES && !tiny_isKnown(addr)) {
     tinyAddrs[tinyCount++] = addr;
   }
 }
@@ -228,11 +228,12 @@ static void tiny_remove(uint8_t addr) {
 // DOWNSTREAM: NEXT AVAILABLE ADDRESS
 // simple sequential allocator starting at 0x20
 // ─────────────────────────────────────────────────────────────
-static uint8_t nextAvailableAddr = 0x20;
+static uint8_t nextAvailableAddr = TINY_START_ADDRESS;
 
 static uint8_t getNextAddr() {
   // skip addresses already in use
-  while (tiny_isKnown(nextAvailableAddr) && nextAvailableAddr < 0x40) {
+  while (tiny_isKnown(nextAvailableAddr) &&
+         nextAvailableAddr < TINY_START_ADDRESS + MAX_TINY_MODULES) {
     nextAvailableAddr++;
   }
   return nextAvailableAddr++;
@@ -251,7 +252,7 @@ static bool downstream_getUdidCycle() {
   if (err != 0)
     return false; // no device at 0x55
 
-  delay(5); // Give ATtiny85 time to prepare
+  delayMicroseconds(200); // Give ATtiny85 time to prepare
 
   // Step 2: Request UDID - winning ATtiny85 responds
   uint8_t received =
@@ -282,7 +283,7 @@ static bool downstream_getUdidCycle() {
   Wire.endTransmission();
 
   // small delay for slave to reinitialize its Wire
-  delay(10);
+  delayMicroseconds(200);
 
   // Step 5: Verify: by probing new address
   Wire.beginTransmission(newAddr);
@@ -306,10 +307,10 @@ static void downstream_enumerate() {
   Wire.beginTransmission(ADDR_ARP_DEFAULT);
   Wire.write(CMD_PREPARE_ARP);
   Wire.endTransmission();
-  delay(5);
+  delayMicroseconds(200);
 
   // run cycles until no more responses
-  uint8_t maxCycles = MAX_TINY_MODULES;
+  uint8_t maxCycles = (uint8_t)MAX_TINY_MODULES;
   while (maxCycles-- > 0) {
     if (!downstream_getUdidCycle())
       break;
@@ -386,7 +387,7 @@ static void processUpstreamCommand() {
         alertUp_release();
         led_blinkRedOnAssignment();
       } else {
-        delay(20);
+        delay(5);
         alertUp_assert();
       }
     }
