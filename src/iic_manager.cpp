@@ -27,6 +27,7 @@
 
 // ── ATtiny85 module list ──────────────────────────────────────
 static uint8_t tinyAddrs[MAX_TINY_MODULES];
+static uint8_t tinyUdids[MAX_TINY_MODULES][UDID_SIZE];
 static uint8_t tinyCount = 0;
 
 // ── Own state ─────────────────────────────────────────────────
@@ -40,7 +41,7 @@ static volatile uint8_t rxLen = 0;
 static volatile bool rxPending = false;
 
 // ── Reply buffer for CMD_SCAN_MODULES ─────────────────────────────
-static uint8_t replyBuf[MAX_TINY_MODULES + 1];
+static uint8_t replyBuf[1 + MAX_TINY_MODULES * (1 + UDID_SIZE)];
 static uint8_t replyLen = 0;
 static bool replyReady = false;
 
@@ -161,28 +162,26 @@ static void handleSyncPSA(const volatile uint8_t *buf, uint8_t len) {
   if (len < 2)
     return;
   uint8_t count = buf[1];
-  if (count > PSA_MAX_ENTRIES)
-    count = PSA_MAX_ENTRIES;
 
+  // clear all persistent flags first
   for (uint8_t i = 0; i < PSA_MAX_ENTRIES; i++) {
     uint16_t base = EE_PSA_TABLE_START + (i * PSA_ENTRY_SIZE);
-    if (EEPROM.read(base) == 0xFF)
-      continue; // empty slot
-
-    uint8_t storedPSA = EEPROM.read(base + UDID_SIZE);
-    bool isInList = false;
-
-    for (uint8_t j = 0; j < count; j++) {
-      if (buf[2 + j] == storedPSA) {
-        isInList = true;
-        break;
-      }
+    if (EEPROM.read(base) != 0xFF) {
+      EEPROM.write(base + UDID_SIZE + 1, 0x00);
     }
+  }
 
-    uint8_t newFlag = isInList ? 0x01 : 0x00;
-    if (EEPROM.read(base + UDID_SIZE + 1) != newFlag) {
-      EEPROM.write(base + UDID_SIZE + 1, newFlag);
+  // write each received UDID+addr pair as a persistent entry
+  uint8_t offset = 2;
+  for (uint8_t e = 0; e < count; e++) {
+    if (offset + UDID_SIZE >= len)
+      break;
+    uint8_t entryUdid[UDID_SIZE];
+    for (uint8_t j = 0; j < UDID_SIZE; j++) {
+      entryUdid[j] = buf[offset++];
     }
+    uint8_t psa = buf[offset++];
+    psa_store(entryUdid, psa, 0x01);
   }
   EEPROM.commit();
 }
@@ -230,13 +229,29 @@ static void tiny_remove(uint8_t addr) {
 // ─────────────────────────────────────────────────────────────
 static uint8_t nextAvailableAddr = TINY_START_ADDRESS;
 
+static bool psa_isReserved(uint8_t addr) {
+  for (uint8_t i = 0; i < PSA_MAX_ENTRIES; i++) {
+    uint16_t base = EE_PSA_TABLE_START + (i * PSA_ENTRY_SIZE);
+    if (EEPROM.read(base) == 0xFF)
+      continue;
+    if (EEPROM.read(base + UDID_SIZE + 1) == 0x01 &&
+        EEPROM.read(base + UDID_SIZE) == addr) {
+      return true;
+    }
+  }
+  return false;
+}
+
 static uint8_t getNextAddr() {
-  // skip addresses already in use
-  while (tiny_isKnown(nextAvailableAddr) &&
-         nextAvailableAddr < TINY_START_ADDRESS + MAX_TINY_MODULES) {
+  // search full valid I2C range, no hard ceiling tied to module count
+  while (nextAvailableAddr <= 0x77) {
+    if (!tiny_isKnown(nextAvailableAddr) &&
+        !psa_isReserved(nextAvailableAddr)) {
+      return nextAvailableAddr++;
+    }
     nextAvailableAddr++;
   }
-  return nextAvailableAddr++;
+  return 0xFF; // address space exhausted
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -289,6 +304,8 @@ static bool downstream_getUdidCycle() {
   Wire.beginTransmission(newAddr);
   err = Wire.endTransmission();
   if (err == 0) {
+    // store UDID in RAM cache at same index as addr
+    memcpy(tinyUdids[tinyCount], winnerUdid, UDID_SIZE);
     tiny_add(newAddr);
     // store working record, not persistent until ESP32 syncs
     psa_store(winnerUdid, newAddr, 0x00);
@@ -405,15 +422,22 @@ static void processUpstreamCommand() {
     Wire1.onRequest(onRequest);
     break;
 
-  // ESP32 requests list of ATtiny85 addresses
-  // Response is sent via onRequest on next master read
-  // Store count + list in a reply buffer for onRequest
   case CMD_SCAN_MODULES:
+    // ESP32 requests list of ATtiny85 addresses
+    // Response is sent via onRequest on next master read
+    // Store count + list in a reply buffer for onRequest
     downstream_scan();
-    replyBuf[0] = tinyCount;
-    for (uint8_t i = 0; i < tinyCount; i++)
-      replyBuf[i + 1] = tinyAddrs[i];
-    replyLen = tinyCount + 1;
+    {
+      replyBuf[0] = tinyCount;
+      uint8_t offset = 1;
+      for (uint8_t i = 0; i < tinyCount; i++) {
+        replyBuf[offset++] = tinyAddrs[i];
+        for (uint8_t j = 0; j < UDID_SIZE; j++) {
+          replyBuf[offset++] = tinyUdids[i][j];
+        }
+      }
+      replyLen = offset;
+    }
     replyReady = true;
     break;
 
@@ -472,7 +496,7 @@ void iic_init() {
 
   while (true) {
     // synchronization, to synzhronize with other rp2040s
-    if (millis() > 1000 || digitalRead(PIN_ALERT_UP) == LOW) {
+    if (millis() > WAIT_FOR_ESP32_MS || digitalRead(PIN_ALERT_UP) == LOW) {
       alertUp_assert();
       break;
     }

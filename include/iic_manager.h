@@ -54,10 +54,11 @@
 // ── SYSTEM PROTOCOL CONSTRAINTS -------------------------------
 #define MAX_TINY_MODULES 500
 #define TINY_START_ADDRESS 0x40
-#define RX_BUF_SIZE 16
+#define RX_BUF_SIZE 128
 
 // ── OTHER -----------------------------------------------------
 #define SCAN_INTERVAL_MS 5000
+#define WAIT_FOR_ESP32_MS 500
 
 void iic_init();
 void iic_update();
