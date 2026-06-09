@@ -17,6 +17,8 @@
 #define PIN_ALERT_UP 15  // ALERT to ESP32 (open-drain output)
 #define PIN_ALERT_DOWN 2 // ALERT from ATtiny85 (input, external pull-up)
 
+#define ALERT_DEBOUNCE_MS 20
+
 // ── I2C addresses ─────────────────────────────────────────────
 #define ADDR_ARP_DEFAULT 0x55
 #define ADDR_UNASSIGNED 0x55
@@ -58,7 +60,7 @@
 
 // ── OTHER -----------------------------------------------------
 #define SCAN_INTERVAL_MS 5000
-#define WAIT_FOR_ESP32_MS 500
+#define WAIT_FOR_ESP32_MS 250
 
 void iic_init();
 void iic_update();

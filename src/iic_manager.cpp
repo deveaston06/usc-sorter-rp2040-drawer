@@ -190,8 +190,14 @@ static void handleSyncPSA(const volatile uint8_t *buf, uint8_t len) {
 // ALERT DOWN ISR
 // ─────────────────────────────────────────────────────────────
 static volatile bool alertDownPending = false;
+static volatile uint32_t alertDownDebounceMs = 0;
+static volatile bool downstreamBusBusy = false;
 
-static void onAlertDown() { alertDownPending = true; }
+static void onAlertDown() {
+  alertDownPending = true;
+  alertDownDebounceMs = millis();
+  downstreamBusBusy = true;
+}
 
 // ─────────────────────────────────────────────────────────────
 // DOWNSTREAM: ATTINY85 MODULE LIST HELPERS
@@ -260,6 +266,10 @@ static uint8_t getNextAddr() {
 // psa_lookup() only returns the address if ESP32 later marks it persistent.
 // ─────────────────────────────────────────────────────────────
 static bool downstream_getUdidCycle() {
+  if (downstreamBusBusy) {
+    return false; // Defer until bus settles
+  }
+
   // Step 1: Send CMD_GET_UDID
   Wire.beginTransmission(ADDR_ARP_DEFAULT);
   Wire.write(CMD_GET_UDID);
@@ -281,6 +291,17 @@ static bool downstream_getUdidCycle() {
   for (uint8_t i = 0; i < UDID_SIZE; i++) {
     winnerUdid[i] = Wire.read();
   }
+
+  // Validate UDID - reject all 0xFF or all 0x00 (noise)
+  bool validUdid = false;
+  for (uint8_t i = 0; i < UDID_SIZE; i++) {
+    if (winnerUdid[i] != 0xFF && winnerUdid[i] != 0x00) {
+      validUdid = true;
+      break;
+    }
+  }
+  if (!validUdid)
+    return false;
 
   // Step 3: PSA lookup — only succeeds if ESP32 marked this address persistent
   uint8_t newAddr = psa_lookup(winnerUdid);
@@ -320,6 +341,11 @@ static bool downstream_getUdidCycle() {
 // ─────────────────────────────────────────────────────────────
 static void downstream_enumerate() {
   detachInterrupt(digitalPinToInterrupt(PIN_ALERT_DOWN));
+
+  // Wait for bus to settle
+  delay(ALERT_DEBOUNCE_MS);
+  downstreamBusBusy = false;
+
   // reset all devices first
   Wire.beginTransmission(ADDR_ARP_DEFAULT);
   Wire.write(CMD_PREPARE_ARP);
@@ -524,8 +550,14 @@ void iic_update() {
 
   // handle downstream ALERT — new ATtiny85 plugged in
   if (alertDownPending) {
-    alertDownPending = false;
-    downstream_enumerate();
+    if (millis() - alertDownDebounceMs >= ALERT_DEBOUNCE_MS) {
+      alertDownPending = false;
+      if (digitalRead(PIN_ALERT_DOWN) == LOW) {
+        // confirmed stable LOW — real hot-plug event
+        downstream_enumerate();
+      }
+      // else: bounce, discard
+    }
   }
 
   // periodic scanner
