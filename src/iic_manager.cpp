@@ -192,6 +192,7 @@ static void handleSyncPSA(const volatile uint8_t *buf, uint8_t len) {
 static volatile bool alertDownPending = false;
 static volatile uint32_t alertDownDebounceMs = 0;
 static volatile bool downstreamBusBusy = false;
+static bool scanPending = false;
 
 static void onAlertDown() {
   alertDownPending = true;
@@ -261,6 +262,63 @@ static uint8_t getNextAddr() {
 }
 
 // ─────────────────────────────────────────────────────────────
+// DOWNSTREAM WIRE RETRY WRAPPERS
+// Retries up to WIRE_RETRY_COUNT times if ALERT bouncing during transmission
+// ─────────────────────────────────────────────────────────────
+
+static uint8_t wire0_write(uint8_t addr, uint8_t cmd) {
+  for (uint8_t i = 0; i < WIRE_RETRY_COUNT; i++) {
+    if (alertDownPending &&
+        (millis() - alertDownDebounceMs) < ALERT_DEBOUNCE_MS) {
+      delay(ALERT_DEBOUNCE_MS);
+      continue;
+    }
+    Wire.beginTransmission(addr);
+    Wire.write(cmd);
+    if (Wire.endTransmission() == 0)
+      return 0;
+    delayMicroseconds(500);
+  }
+  return 1;
+}
+
+static uint8_t wire0_write_buf(uint8_t addr, const uint8_t *data, uint8_t len) {
+  for (uint8_t i = 0; i < WIRE_RETRY_COUNT; i++) {
+    if (alertDownPending &&
+        (millis() - alertDownDebounceMs) < ALERT_DEBOUNCE_MS) {
+      delay(ALERT_DEBOUNCE_MS);
+      continue;
+    }
+    Wire.beginTransmission(addr);
+    Wire.write(data, len);
+    if (Wire.endTransmission() == 0)
+      return 0;
+    delayMicroseconds(500);
+  }
+  return 1;
+}
+
+static uint8_t wire0_request(uint8_t addr, uint8_t len, uint8_t *buf) {
+  for (uint8_t i = 0; i < WIRE_RETRY_COUNT; i++) {
+    if (alertDownPending &&
+        (millis() - alertDownDebounceMs) < ALERT_DEBOUNCE_MS) {
+      delay(ALERT_DEBOUNCE_MS);
+      continue;
+    }
+    uint8_t received = Wire.requestFrom(addr, len);
+    if (received >= len) {
+      for (uint8_t j = 0; j < len; j++)
+        buf[j] = Wire.read();
+      return received;
+    }
+    while (Wire.available())
+      Wire.read(); // drain partial
+    delayMicroseconds(500);
+  }
+  return 0;
+}
+
+// ─────────────────────────────────────────────────────────────
 // DOWNSTREAM: GET_UDID CYCLE FOR ATTINY85
 // Stores working PSA entry (persistent=0) after assignment.
 // psa_lookup() only returns the address if ESP32 later marks it persistent.
@@ -279,18 +337,16 @@ static bool downstream_getUdidCycle() {
 
   delayMicroseconds(200); // Give ATtiny85 time to prepare
 
-  // Step 2: Request UDID - winning ATtiny85 responds
-  uint8_t received =
-      Wire.requestFrom((uint8_t)ADDR_ARP_DEFAULT, (uint8_t)UDID_SIZE);
+  // Step 1: send GET_UDID command
+  if (wire0_write(ADDR_ARP_DEFAULT, CMD_GET_UDID) != 0)
+    return false;
 
-  if (received < UDID_SIZE) {
-    return false; // No device responded
-  }
+  delayMicroseconds(200);
 
+  // Step 2: read winner UDID
   uint8_t winnerUdid[UDID_SIZE];
-  for (uint8_t i = 0; i < UDID_SIZE; i++) {
-    winnerUdid[i] = Wire.read();
-  }
+  if (wire0_request(ADDR_ARP_DEFAULT, UDID_SIZE, winnerUdid) < UDID_SIZE)
+    return false;
 
   // Validate UDID - reject all 0xFF or all 0x00 (noise)
   bool validUdid = false;
@@ -308,17 +364,21 @@ static bool downstream_getUdidCycle() {
   if (newAddr == 0xFF) {
     newAddr = getNextAddr();
   }
-
-  // Step 4: Assign address
-  Wire.beginTransmission(ADDR_ARP_DEFAULT);
-  Wire.write(CMD_ASSIGN_ADDR);
-  for (uint8_t i = 0; i < UDID_SIZE; i++) {
-    Wire.write(winnerUdid[i]);
+  if (newAddr == 0xFF) {
+    // if still exhausted
+    return false;
   }
-  Wire.write(newAddr);
-  Wire.endTransmission();
 
-  // small delay for slave to reinitialize its Wire
+  // Step 4: send ASSIGN_ADDR
+  uint8_t payload[UDID_SIZE + 2];
+  payload[0] = CMD_ASSIGN_ADDR;
+  memcpy(&payload[1], winnerUdid, UDID_SIZE);
+  payload[UDID_SIZE + 1] = newAddr;
+
+  if (wire0_write_buf(ADDR_ARP_DEFAULT, payload, sizeof(payload)) != 0) {
+    return false;
+  }
+
   delayMicroseconds(200);
 
   // Step 5: Verify: by probing new address
@@ -383,6 +443,25 @@ static void onReceive(int numBytes) {
   while (Wire1.available() && rxLen < RX_BUF_SIZE) {
     rxBuf[rxLen++] = Wire1.read();
   }
+
+  // CMD_SCAN_MODULES: prepare reply immediately in ISR from cached arrays
+  // so replyBuf is ready before onRequest fires — eliminates repeat-address bug
+  // downstream_scan() runs asynchronously via scanPending flag in main loop
+  if (rxLen > 0 && rxBuf[0] == CMD_SCAN_MODULES) {
+    replyBuf[0] = tinyCount;
+    uint8_t offset = 1;
+    for (uint8_t i = 0; i < tinyCount; i++) {
+      replyBuf[offset++] = tinyAddrs[i];
+      for (uint8_t j = 0; j < UDID_SIZE; j++) {
+        replyBuf[offset++] = tinyUdids[i][j];
+      }
+    }
+    replyLen = offset;
+    replyReady = true;
+    scanPending = true;
+    return; // do not set rxPending — handled entirely here
+  }
+
   rxPending = true;
 }
 
@@ -446,25 +525,6 @@ static void processUpstreamCommand() {
     Wire1.begin(ADDR_ARP_DEFAULT);
     Wire1.onReceive(onReceive);
     Wire1.onRequest(onRequest);
-    break;
-
-  case CMD_SCAN_MODULES:
-    // ESP32 requests list of ATtiny85 addresses
-    // Response is sent via onRequest on next master read
-    // Store count + list in a reply buffer for onRequest
-    downstream_scan();
-    {
-      replyBuf[0] = tinyCount;
-      uint8_t offset = 1;
-      for (uint8_t i = 0; i < tinyCount; i++) {
-        replyBuf[offset++] = tinyAddrs[i];
-        for (uint8_t j = 0; j < UDID_SIZE; j++) {
-          replyBuf[offset++] = tinyUdids[i][j];
-        }
-      }
-      replyLen = offset;
-    }
-    replyReady = true;
     break;
 
   case CMD_SYNC_PSA:
@@ -558,6 +618,11 @@ void iic_update() {
       }
       // else: bounce, discard
     }
+  }
+
+  if (scanPending) {
+    scanPending = false;
+    downstream_scan();
   }
 
   // periodic scanner

@@ -61,6 +61,7 @@
 // ── OTHER -----------------------------------------------------
 #define SCAN_INTERVAL_MS 5000
 #define WAIT_FOR_ESP32_MS 250
+#define WIRE_RETRY_COUNT 3
 
 void iic_init();
 void iic_update();
