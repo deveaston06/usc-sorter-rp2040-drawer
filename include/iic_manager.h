@@ -54,7 +54,7 @@
 #define CAPABILITIES 0x03 // master + slave
 
 // ── SYSTEM PROTOCOL CONSTRAINTS -------------------------------
-#define MAX_TINY_MODULES 500
+#define MAX_TINY_MODULES 225
 #define TINY_START_ADDRESS 0x40
 #define RX_BUF_SIZE 128
 
@@ -66,5 +66,7 @@
 void iic_init();
 void iic_update();
 void iic_writeUDID(uint32_t serialNumber);
+static void tiny_remove(uint8_t addr);
+static void downstream_enumerate();
 
 #endif // !IIC_MANAGER_H

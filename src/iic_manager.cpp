@@ -107,10 +107,9 @@ static uint8_t psa_lookup(const uint8_t *targetUdid) {
       }
     }
     if (match) {
-      uint8_t persistent = EEPROM.read(base + UDID_SIZE + 1);
-      // only return stored address if ESP32 has marked it persistent
-      if (persistent == 0x01)
-        return EEPROM.read(base + UDID_SIZE);
+      // Return address regardless of persistent flag
+      // (persistent flag only controls whether the address is RESERVED)
+      return EEPROM.read(base + UDID_SIZE);
     }
   }
   return 0xFF;
@@ -118,7 +117,7 @@ static uint8_t psa_lookup(const uint8_t *targetUdid) {
 
 static void psa_store(const uint8_t *targetUdid, uint8_t psa,
                       uint8_t persistent) {
-  // update existing entry
+  // Check if entry already exists — preserve persistent flag
   for (uint8_t i = 0; i < PSA_MAX_ENTRIES; i++) {
     uint16_t base = EE_PSA_TABLE_START + (i * PSA_ENTRY_SIZE);
     bool match = true;
@@ -129,6 +128,14 @@ static void psa_store(const uint8_t *targetUdid, uint8_t psa,
       }
     }
     if (match) {
+      uint8_t existingPersistent = EEPROM.read(base + UDID_SIZE + 1);
+      if (existingPersistent == 0x01 && persistent == 0x00) {
+        // Don't downgrade a persistent entry to non-persistent
+        // But DO update the address if it changed
+        EEPROM.write(base + UDID_SIZE, psa);
+        EEPROM.commit();
+        return;
+      }
       EEPROM.write(base + UDID_SIZE, psa);
       EEPROM.write(base + UDID_SIZE + 1, persistent);
       EEPROM.commit();
@@ -157,13 +164,11 @@ static void psa_store(const uint8_t *targetUdid, uint8_t psa,
 // Entries whose address is not in the received list are cleared to 0.
 // ─────────────────────────────────────────────────────────────
 static void handleSyncPSA(const volatile uint8_t *buf, uint8_t len) {
-  // buf[0] = CMD_SYNC_PSA already consumed
-  // buf[1] = count, buf[2..] = addresses
   if (len < 2)
     return;
   uint8_t count = buf[1];
 
-  // clear all persistent flags first
+  // Clear all persistent flags first
   for (uint8_t i = 0; i < PSA_MAX_ENTRIES; i++) {
     uint16_t base = EE_PSA_TABLE_START + (i * PSA_ENTRY_SIZE);
     if (EEPROM.read(base) != 0xFF) {
@@ -171,7 +176,7 @@ static void handleSyncPSA(const volatile uint8_t *buf, uint8_t len) {
     }
   }
 
-  // write each received UDID+addr pair as a persistent entry
+  // Write received entries
   uint8_t offset = 2;
   for (uint8_t e = 0; e < count; e++) {
     if (offset + UDID_SIZE >= len)
@@ -182,8 +187,29 @@ static void handleSyncPSA(const volatile uint8_t *buf, uint8_t len) {
     }
     uint8_t psa = buf[offset++];
     psa_store(entryUdid, psa, 0x01);
+
+    // ── NEW: Check for conflicts with currently assigned ATtiny85s ──
+    for (uint8_t i = 0; i < tinyCount; i++) {
+      if (tinyAddrs[i] == psa) {
+        // A device is at this PSA address
+        // Is it the PSA owner?
+        if (memcmp(tinyUdids[i], entryUdid, UDID_SIZE) != 0) {
+          // CONFLICT: different device at PSA address — evict it
+          Wire.beginTransmission(psa);
+          Wire.write(CMD_PREPARE_ARP);
+          Wire.endTransmission();
+          delayMicroseconds(200);
+          tiny_remove(psa);
+        }
+      }
+    }
   }
   EEPROM.commit();
+
+  // Re-enumerate any evicted devices
+  if (tinyCount < MAX_TINY_MODULES) {
+    downstream_enumerate();
+  }
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -250,15 +276,24 @@ static bool psa_isReserved(uint8_t addr) {
 }
 
 static uint8_t getNextAddr() {
-  // search full valid I2C range, no hard ceiling tied to module count
   while (nextAvailableAddr <= 0x77) {
+    Serial.print("getNextAddr checking 0x");
+    Serial.print(nextAvailableAddr, HEX);
+    Serial.print(" known=");
+    Serial.print(tiny_isKnown(nextAvailableAddr));
+    Serial.print(" reserved=");
+    Serial.println(psa_isReserved(nextAvailableAddr));
+
     if (!tiny_isKnown(nextAvailableAddr) &&
         !psa_isReserved(nextAvailableAddr)) {
-      return nextAvailableAddr++;
+      uint8_t ret = nextAvailableAddr++;
+      Serial.print("getNextAddr returning 0x");
+      Serial.println(ret, HEX);
+      return ret;
     }
     nextAvailableAddr++;
   }
-  return 0xFF; // address space exhausted
+  return 0xFF;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -320,22 +355,17 @@ static uint8_t wire0_request(uint8_t addr, uint8_t len, uint8_t *buf) {
 
 // ─────────────────────────────────────────────────────────────
 // DOWNSTREAM: GET_UDID CYCLE FOR ATTINY85
-// Stores working PSA entry (persistent=0) after assignment.
-// psa_lookup() only returns the address if ESP32 later marks it persistent.
+// PSA conflict resolution:
+//   1. Read winner UDID
+//   2. PSA lookup — if persistent, that address is RESERVED
+//   3. If another ATtiny85 currently uses that reserved address,
+//      reassign it FIRST (send PREPARE_ARP, re-enumerate it)
+//   4. Then assign the PSA address to the winning device
 // ─────────────────────────────────────────────────────────────
 static bool downstream_getUdidCycle() {
   if (downstreamBusBusy) {
-    return false; // Defer until bus settles
+    return false;
   }
-
-  // Step 1: Send CMD_GET_UDID
-  Wire.beginTransmission(ADDR_ARP_DEFAULT);
-  Wire.write(CMD_GET_UDID);
-  uint8_t err = Wire.endTransmission();
-  if (err != 0)
-    return false; // no device at 0x55
-
-  delayMicroseconds(200); // Give ATtiny85 time to prepare
 
   // Step 1: send GET_UDID command
   if (wire0_write(ADDR_ARP_DEFAULT, CMD_GET_UDID) != 0)
@@ -359,9 +389,44 @@ static bool downstream_getUdidCycle() {
   if (!validUdid)
     return false;
 
-  // Step 3: PSA lookup — only succeeds if ESP32 marked this address persistent
-  uint8_t newAddr = psa_lookup(winnerUdid);
-  if (newAddr == 0xFF) {
+  // Step 3: PSA lookup
+  uint8_t psaAddr = psa_lookup(winnerUdid);
+  uint8_t newAddr;
+
+  if (psaAddr != 0xFF) {
+    // ── PSA exists for this UDID ──────────────────────────
+    // Check if another ATtiny85 currently occupies this address
+    int8_t conflictIdx = -1;
+    for (uint8_t i = 0; i < tinyCount; i++) {
+      if (tinyAddrs[i] == psaAddr) {
+        // Is this the SAME device (same UDID)?
+        if (memcmp(tinyUdids[i], winnerUdid, UDID_SIZE) != 0) {
+          conflictIdx = i; // Different device at PSA address!
+        }
+        break;
+      }
+    }
+
+    if (conflictIdx >= 0) {
+      // ── Conflict: evict existing device ────────────────
+      uint8_t conflictAddr = tinyAddrs[conflictIdx];
+
+      // Send PREPARE_ARP to the conflicting device
+      Wire.beginTransmission(conflictAddr);
+      Wire.write(CMD_PREPARE_ARP);
+      Wire.endTransmission();
+      delayMicroseconds(200);
+
+      // Remove from our list
+      tiny_remove(conflictAddr);
+
+      // Give it a moment to reset to ARP address
+      delay(5);
+    }
+
+    newAddr = psaAddr;
+  } else {
+    // ── No PSA — get next available ──────────────────────
     newAddr = getNextAddr();
   }
   if (newAddr == 0xFF) {
@@ -381,15 +446,17 @@ static bool downstream_getUdidCycle() {
 
   delayMicroseconds(200);
 
-  // Step 5: Verify: by probing new address
+  // Step 5: Verify by probing new address
   Wire.beginTransmission(newAddr);
-  err = Wire.endTransmission();
+  uint8_t err = Wire.endTransmission();
   if (err == 0) {
-    // store UDID in RAM cache at same index as addr
     memcpy(tinyUdids[tinyCount], winnerUdid, UDID_SIZE);
     tiny_add(newAddr);
-    // store working record, not persistent until ESP32 syncs
     psa_store(winnerUdid, newAddr, 0x00);
+
+    // If we evicted a device, run one more cycle to reassign it
+    // The evicted device is now at ARP address waiting
+
     return true;
   }
   return false;
@@ -398,26 +465,42 @@ static bool downstream_getUdidCycle() {
 // ─────────────────────────────────────────────────────────────
 // DOWNSTREAM: FULL ENUMERATION SEQUENCE
 // Repeats GET_UDID cycles until no more unresolved devices
+// After main loop, handle any evicted devices
 // ─────────────────────────────────────────────────────────────
 static void downstream_enumerate() {
   detachInterrupt(digitalPinToInterrupt(PIN_ALERT_DOWN));
 
-  // Wait for bus to settle
   delay(ALERT_DEBOUNCE_MS);
   downstreamBusBusy = false;
 
-  // reset all devices first
+  // First pass: discover initial devices
   Wire.beginTransmission(ADDR_ARP_DEFAULT);
   Wire.write(CMD_PREPARE_ARP);
   Wire.endTransmission();
   delayMicroseconds(200);
 
-  // run cycles until no more responses
   uint8_t maxCycles = (uint8_t)MAX_TINY_MODULES;
   while (maxCycles-- > 0) {
     if (!downstream_getUdidCycle())
       break;
   }
+
+  delay(5);
+
+  if (digitalRead(PIN_ALERT_DOWN) == LOW) {
+    // Evicted devices are waiting — run second pass
+    Wire.beginTransmission(ADDR_ARP_DEFAULT);
+    Wire.write(CMD_PREPARE_ARP);
+    Wire.endTransmission();
+    delayMicroseconds(200);
+
+    maxCycles = (uint8_t)MAX_TINY_MODULES;
+    while (maxCycles-- > 0) {
+      if (!downstream_getUdidCycle())
+        break;
+    }
+  }
+
   attachInterrupt(digitalPinToInterrupt(PIN_ALERT_DOWN), onAlertDown, FALLING);
 }
 
